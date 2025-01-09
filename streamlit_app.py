@@ -44,18 +44,29 @@ def generate_embedding(text):
         "Content-Type": "application/json",
     }
     data = {"inputs": [text]}
-    response = requests.post(url, headers=headers, json=data)
-    if response.status_code != 200:
-        st.error(f"Error generating embedding: {response.text}")
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()  # Raise an exception for bad status codes
+        return response.json()["predictions"][0]
+    except requests.exceptions.RequestException as e:
+        st.error(f"Error generating embedding for text: '{text[:50]}...'")  # Print part of the text
+        st.error(f"Request error: {e}")
+        if 'response' in locals():
+          st.error(f"Response status code: {response.status_code}")
+          st.error(f"Response text: {response.text}")
+        else:
+          st.error("Response object not available")
         return None
-    return response.json()["predictions"][0]
+    except (KeyError, IndexError) as e:
+        st.error(f"Error parsing embedding response: {e}")
+        return None
 
 def generate_embeddings(text_chunks):
     """Generates embeddings for a list of text chunks."""
     embeddings = []
     for chunk in text_chunks:
         embedding = generate_embedding(chunk)
-        if embedding:
+        if embedding is not None:  # Only add if embedding was generated successfully
             embeddings.append(embedding)
     return np.array(embeddings)
 
@@ -113,14 +124,26 @@ if uploaded_files:
     for uploaded_file in uploaded_files:
         # Process uploaded files directly using BytesIO
         pdf_text = extract_text_from_pdf(uploaded_file)
-        chunks = chunk_text(pdf_text)        
+        chunks = chunk_text(pdf_text)
         all_chunks.extend([(uploaded_file.name, chunk) for chunk in chunks])
 
     # Using st.cache_data to cache embeddings and index
     @st.cache_data(show_spinner=True)
     def process_and_index(all_chunks):
         all_text_chunks = [chunk for _, chunk in all_chunks]
+
+        # Handle empty all_text_chunks
+        if not all_text_chunks:
+            st.warning("No text chunks found in the uploaded documents.")
+            return None, None  # Or raise an exception, or return a default index
+
         embeddings = generate_embeddings(all_text_chunks)
+
+        # Handle cases where no embeddings were generated
+        if embeddings is None or embeddings.size == 0:
+            st.warning("Could not generate embeddings for any text chunks.")
+            return None, None
+
         dimension = embeddings.shape[1]
         index = faiss.IndexFlatIP(dimension)  # Using Inner Product
         add_embeddings_to_index(index, embeddings)
