@@ -1,10 +1,11 @@
 import streamlit as st
 import fitz  # PyMuPDF
-import faiss
-import numpy as np
 import requests
 import json
+import io
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from PIL import Image
+import pytesseract
 
 # --- Databricks API Configuration ---
 # Use st.secrets to store sensitive information
@@ -13,71 +14,55 @@ DATABRICKS_TOKEN = st.secrets["DATABRICKS_TOKEN"]
 
 # --- Endpoint Names ---
 LLM_ENDPOINT_NAME = "databricks-meta-llama-3-70b-instruct"  # Replace with your LLM endpoint name
-EMBEDDING_ENDPOINT_NAME = "databricks-gte-large-en"  # Replace with your embedding endpoint name
 
 # --- Helper Functions ---
-def extract_text_from_pdf(pdf_path):
-    """Extracts text from a PDF file using PyMuPDF."""
+def extract_text_from_pdf(pdf_file):
+    """Extracts text from a PDF file, using OCR if necessary."""
     text = ""
     try:
-        with fitz.open(pdf_path) as doc:
+        # Open the PDF from the BytesIO object
+        with fitz.open(stream=pdf_file.read(), filetype="pdf") as doc:
+            print(f"Number of pages: {doc.page_count}")
             for page in doc:
-                text += page.get_text()
+                # Try to get text directly
+                page_text = page.get_text()
+                if page_text.strip():  # If text is found, use it
+                    print(f"Page {page.number + 1} (text):\n{page_text[:200]}...")
+                    text += page_text
+                else:  # Otherwise, try OCR
+                    print(f"Page {page.number + 1} (image): Performing OCR...")
+                    # Get image of the page
+                    image_list = page.get_images(full=True)
+                    if image_list:
+                        # Get the xref of the image
+                        xref = image_list[0][0]
+                        # Extract the image
+                        base_image = doc.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        # Convert to PIL image
+                        image = Image.open(io.BytesIO(image_bytes))
+                        # Perform OCR
+                        page_text = pytesseract.image_to_string(image)
+                        print(f"Page {page.number + 1} (OCR):\n{page_text[:200]}...")
+                        text += page_text
     except Exception as e:
         st.error(f"Error processing PDF: {e}")
+        print(f"Error processing PDF: {e}")
         return ""
+    print(f"Extracted text length: {len(text)}")
     return text
 
-def chunk_text(text, chunk_size=768, chunk_overlap=50):
+def chunk_text(text, chunk_size=3000, chunk_overlap=100):  # Tweaked chunk size
     """Splits the text into chunks using LangChain's RecursiveCharacterTextSplitter."""
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
-    return text_splitter.split_text(text)
-
-def generate_embedding(text):
-    """Generates an embedding for a given text using the Databricks serving endpoint."""
-    url = f"{DATABRICKS_HOST}/serving-endpoints/{EMBEDDING_ENDPOINT_NAME}/invocations"
-    headers = {
-        "Authorization": f"Bearer {DATABRICKS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    data = {"inputs": [text]}
-    try:
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()  # Raise an exception for bad status codes
-        return response.json()["predictions"][0]
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error generating embedding for text: '{text[:50]}...'")  # Print part of the text
-        st.error(f"Request error: {e}")
-        if 'response' in locals():
-          st.error(f"Response status code: {response.status_code}")
-          st.error(f"Response text: {response.text}")
-        else:
-          st.error("Response object not available")
-        return None
-    except (KeyError, IndexError) as e:
-        st.error(f"Error parsing embedding response: {e}")
-        return None
-
-def generate_embeddings(text_chunks):
-    """Generates embeddings for a list of text chunks."""
-    embeddings = []
-    for chunk in text_chunks:
-        embedding = generate_embedding(chunk)
-        if embedding is not None:  # Only add if embedding was generated successfully
-            embeddings.append(embedding)
-    return np.array(embeddings)
-
-def add_embeddings_to_index(index, embeddings):
-    """Adds embeddings to a FAISS index."""
-    index.add(np.array(embeddings).astype('float32'))
-
-def search_index(index, query_embedding, k=5):
-    """Searches the FAISS index for the top k nearest neighbors."""
-    distances, indices = index.search(np.array([query_embedding]).astype('float32'), k)
-    return indices[0]
+    chunks = text_splitter.split_text(text)
+    print(f"Number of chunks created: {len(chunks)}")
+    for i, chunk in enumerate(chunks):
+        print(f"Chunk {i + 1}:\n{chunk[:200]}...")
+    return chunks
 
 def query_llm(context, question):
     """Queries the LLM serving endpoint with a context and a question."""
@@ -109,10 +94,10 @@ def query_llm(context, question):
     return response.json()["choices"][0]["message"]["content"]
 
 # --- Streamlit App ---
-st.title("📄 Chat with your PDFs using Databricks Endpoints")
+st.title("📄 Chat with your PDFs using Llama 3")
 st.write(
     "Upload one or more PDF documents and ask questions about their content. "
-    f"Powered by {LLM_ENDPOINT_NAME} and {EMBEDDING_ENDPOINT_NAME}."
+    f"Powered by {LLM_ENDPOINT_NAME}."
 )
 
 uploaded_files = st.file_uploader(
@@ -125,32 +110,11 @@ if uploaded_files:
         # Process uploaded files directly using BytesIO
         pdf_text = extract_text_from_pdf(uploaded_file)
         chunks = chunk_text(pdf_text)
-        all_chunks.extend([(uploaded_file.name, chunk) for chunk in chunks])
+        all_chunks.extend(chunks)  # Store chunks directly
 
-    # Using st.cache_data to cache embeddings and index
-    @st.cache_data(show_spinner=True)
-    def process_and_index(all_chunks):
-        all_text_chunks = [chunk for _, chunk in all_chunks]
+    print(f"all_chunks: {all_chunks}")
 
-        # Handle empty all_text_chunks
-        if not all_text_chunks:
-            st.warning("No text chunks found in the uploaded documents.")
-            return None, None  # Or raise an exception, or return a default index
-
-        embeddings = generate_embeddings(all_text_chunks)
-
-        # Handle cases where no embeddings were generated
-        if embeddings is None or embeddings.size == 0:
-            st.warning("Could not generate embeddings for any text chunks.")
-            return None, None
-
-        dimension = embeddings.shape[1]
-        index = faiss.IndexFlatIP(dimension)  # Using Inner Product
-        add_embeddings_to_index(index, embeddings)
-        return embeddings, index
-
-    with st.spinner('Processing documents and creating index...'):
-        embeddings, index = process_and_index(all_chunks)
+    # No need for caching embeddings and index
 
     # Initialize chat history
     if "messages" not in st.session_state:
@@ -168,19 +132,16 @@ if uploaded_files:
         # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": question})
 
-        query_embedding = generate_embedding(question)
-        if query_embedding is not None:
-            relevant_indices = search_index(index, query_embedding, k=5)
-            relevant_chunks = [all_chunks[i][1] for i in relevant_indices]
-            context = "\n\n".join(relevant_chunks)
+        # Concatenate all chunks for simplicity (consider more advanced strategies for long documents)
+        context = "\n\n".join(all_chunks)
 
-            # Query the LLM serving endpoint
-            with st.spinner("Generating response..."):
-                response = query_llm(context, question)
+        # Query the Llama 3 serving endpoint
+        with st.spinner("Generating response..."):
+            response = query_llm(context, question)
 
-            if response:
-                with st.chat_message("assistant"):
-                    st.markdown(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
+        if response:
+            with st.chat_message("assistant"):
+                st.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
 else:
     st.write("Please upload some PDF documents to get started.")

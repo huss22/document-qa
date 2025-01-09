@@ -3,3 +3,4 @@ pymupdf
 faiss-cpu
 requests
 langchain
+pytesseract
