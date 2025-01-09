@@ -1,2 +1,5 @@
 streamlit
-openai
+pymupdf
+faiss-cpu
+requests
+langchain
